@@ -43,6 +43,7 @@ class Detect(nn.Module):
 
     def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
         super().__init__()
+        self.dequant = torch.ao.quantization.DeQuantStub()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
         self.nl = len(anchors)  # number of detection layers
@@ -52,11 +53,14 @@ class Detect(nn.Module):
         self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
         self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.quant = torch.ao.quantization.QuantStub()
+        
 
     def forward(self, x):
         z = []  # inference output
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
+            x[i] = self.dequant(x[i])
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
@@ -355,6 +359,67 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
 
+class QuantizedYolo(nn.Module):
+    def __init__(self, model_fp32):
+        super(QuantizedYolo, self).__init__()
+        
+        model_fp32.eval()
+        print('Prepare PTQ Fusing')
+        for m in model_fp32.modules():
+            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
+                m.prepare_q()
+                
+        model_fp32.info()
+            
+        self.quant = torch.ao.quantization.QuantStub()
+        self.model_fp32 = model_fp32
+        self.dequant = torch.ao.quantization.DeQuantStub()
+        
+        self.qconfig = torch.ao.quantization.get_default_qconfig('x86')
+        torch.ao.quantization.prepare(self, inplace=True)
+    
+    def forward(self,x):
+        try:
+            x = self.quant(x)
+        except:
+            breakpoint()
+            
+        x = self.model_fp32(x)
+        return x
+    
+def print_size_of_model(model):
+    torch.save(model.state_dict(), "temp.p")
+    print('Size (MB):', os.path.getsize("temp.p")/1e6)
+    os.remove('temp.p')
+    
+def Convert_ONNX(model, input, filename): 
+
+    # set the model to inference mode 
+    model.eval() 
+    dummy_input = input
+    dynamic = {'images': {0: 'batch', 2: 'height', 3: 'width'}}
+    dynamic['output0'] = {0: 'batch', 1: 'anchors'}
+    dynamic_axes={'modelInput' : {0 : 'batch_size'},    # variable length axes 
+                                'output0' : {0 : 'batch_size'}}
+    # Export the model   
+#     torch.onnx.export(model, dummy_input, filename, opset_version=12)
+    torch.onnx.export(model,         # model being run 
+        dummy_input,       # model input (or a tuple for multiple inputs) 
+        filename,       # where to save the model  
+        export_params=True,  # store the trained parameter weights inside the model file 
+        opset_version=18,    # the ONNX version to export the model to 
+        do_constant_folding=True,  # whether to execute constant folding for optimization 
+        input_names = ['modelInput'],   # the model's input names 
+        output_names = ['output0'], # the model's output names 
+        dynamic_axes=dynamic) 
+    
+    path = filename
+    model_onnx = onnx.load(path)
+    onnx.checker.check_model(model_onnx)
+    onnx.save(model_onnx, path)
+    print(" ") 
+    print('Model has been converted to ONNX') 
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -369,23 +434,91 @@ if __name__ == '__main__':
     print_args(vars(opt))
     device = select_device(opt.device)
 
+    # # Create model
+    # im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
+    # model = Model(opt.cfg).to(device)
+
+    # # Options
+    # if opt.line_profile:  # profile layer by layer
+    #     model(im, profile=True)
+
+    # elif opt.profile:  # profile forward-backward
+    #     results = profile(input=im, ops=[model], n=3)
+
+    # elif opt.test:  # test all models
+    #     for cfg in Path(ROOT / 'models').rglob('yolo*.yaml'):
+    #         try:
+    #             _ = Model(cfg)
+    #         except Exception as e:
+    #             print(f'Error in {cfg}: {e}')
+
+    # else:  # report fused model summary
+    #     model.fuse()
+
     # Create model
-    im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
-    model = Model(opt.cfg).to(device)
+    cfg = "models/yolov5n.yaml"
+    model = Model(cfg).eval()
+    device = "cpu"
+    ckpt = torch.load('./yolov5n.pt', map_location=device)
+    csd = ckpt['model'].float().state_dict()
+    csd = intersect_dicts(csd, model.state_dict())
 
-    # Options
-    if opt.line_profile:  # profile layer by layer
-        model(im, profile=True)
+    stride = max(int(model.stride.max()), 32)
+    
+    # Copy the Original Model
+    model_fp = deepcopy(model)
 
-    elif opt.profile:  # profile forward-backward
-        results = profile(input=im, ops=[model], n=3)
+    # PTQ Setting for Quantizaiton (Packing)
+    print('Calling Prepare Function')
+    model = QuantizedYolo(model)
+    print_size_of_model(model)
 
-    elif opt.test:  # test all models
-        for cfg in Path(ROOT / 'models').rglob('yolo*.yaml'):
-            try:
-                _ = Model(cfg)
-            except Exception as e:
-                print(f'Error in {cfg}: {e}')
+    # Calibration Dataloader
+    ad, rect = (0.5, True)
+    data = check_dataset('./data/coco128.yaml')
+    trainloader = create_dataloader(data['val'],
+                                    imgsz=640,
+                                    batch_size=32,
+                                    stride=stride,
+                                    single_cls=False,
+                                    pad=0.5,
+                                    rect=rect,
+                                    workers=8,
+                                    prefix=colorstr(f'{"val"}: '))[0]
+    
+    
+    model.eval()
 
-    else:  # report fused model summary
-        model.fuse()
+    # Calibration 
+    for batch_i, (im, targets, paths, shapes) in enumerate(trainloader):
+        im = im.to(device)
+        im = im.float()
+        print(im.shape)
+        im /= 255
+        model(im)
+        if batch_i>3:
+            break
+
+    
+    # Testing
+    x = torch.rand(1, 3, 640, 640)
+    model(x)
+    model_fp(x)
+    
+    model.export = True
+    model.dynamic = True
+
+    # Model Converting (Quantization)
+    quantized_model = torch.quantization.convert(model.eval(), inplace=False)
+    print(quantized_model)
+    print_size_of_model(quantized_model)
+
+    print("Model Conversion Completed")
+    
+    quantized_model.eval()
+    quantized_model(x)
+
+    m = torch.jit.trace(quantized_model.forward, x)
+    Convert_ONNX(model=m, input=x, filename="./yolov5n_Quantized.onnx")
+    path = "./yolov5n_Quantized.onnx"
+    onnx.save(onnx.shape_inference.infer_shapes(onnx.load(path)), path)

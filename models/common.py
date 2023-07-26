@@ -44,19 +44,30 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 
 class Conv(nn.Module):
     # Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)
-    default_act = nn.SiLU()  # default activation
+    default_act = nn.Sigmoid()  # default activation
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
         self.bn = nn.BatchNorm2d(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        self.fcal = nn.quantized.FloatFunctional()
+        
+    def prepare_q(self):
+        torch.ao.quantization.fuse_modules(self,[['conv','bn']],inplace=True)
+
 
     def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+        x = self.bn(self.conv(x))
+        x = self.fcal.mul(x, self.act(x))
+        return x
+#         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
-        return self.act(self.conv(x))
+        x = self.conv(x)
+        x = self.fcal.mul(x, self.act(x))
+        return x
+#         return self.act(self.conv(x))
 
 
 class DWConv(Conv):
@@ -115,9 +126,11 @@ class Bottleneck(nn.Module):
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c_, c2, 3, 1, g=g)
         self.add = shortcut and c1 == c2
+        self.fcal = nn.quantized.FloatFunctional()
+        
 
     def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        return self.fcal.add(x, self.cv2(self.cv1(x))) if self.add else self.cv2(self.cv1(x))
 
 
 class BottleneckCSP(nn.Module):
@@ -162,9 +175,16 @@ class C3(nn.Module):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.fcal = nn.quantized.FloatFunctional()
 
     def forward(self, x):
-        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+        x1 = self.m(self.cv1(x))
+        x2 = self.cv2(x)
+        x = self.fcal.cat((x1, x2), 1)
+        x = self.cv3(x)
+        
+        return x
+#         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
 class C3x(C3):
@@ -223,6 +243,7 @@ class SPPF(nn.Module):
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c_ * 4, c2, 1, 1)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.fcal = nn.quantized.FloatFunctional()
 
     def forward(self, x):
         x = self.cv1(x)
@@ -230,7 +251,11 @@ class SPPF(nn.Module):
             warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
             y1 = self.m(x)
             y2 = self.m(y1)
-            return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
+            y = self.fcal.cat((x, y1, y2, self.m(y2)), 1)
+            y = self.cv2(y)
+            
+            return y
+#             return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
 
 
 class Focus(nn.Module):
@@ -307,8 +332,10 @@ class Concat(nn.Module):
     def __init__(self, dimension=1):
         super().__init__()
         self.d = dimension
+        self.fcal = nn.quantized.FloatFunctional()
 
     def forward(self, x):
+        return self.fcal.cat(x, self.d)
         return torch.cat(x, self.d)
 
 
